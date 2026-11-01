@@ -31,7 +31,7 @@ public class DownloadTask {
         this.state = DownloadState.QUEUED;
     }
 
-    public DownloadState getState() {
+    public synchronized DownloadState getState() {
         return this.state;
     }
 
@@ -42,7 +42,7 @@ public class DownloadTask {
     public Path getDestination() {
         return destination;
     }
-    public void transitionTo(DownloadState state) {
+    public synchronized void  transitionTo(DownloadState state) {
         if (state == null) {
             throw new IllegalArgumentException("Download state cannot be null");
         }

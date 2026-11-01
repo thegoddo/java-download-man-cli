@@ -9,6 +9,19 @@ public class RangeRequestDemo {
     public static void main(String[] args) throws Exception {
 
         HttpClient client = HttpClient.newHttpClient();
+        int totalFileSize = 100000;
+        int bytes = 8192;
+        long downloadedBytes = 0;
+        double downloadProgress = 0;
+        int remainingSize = totalFileSize;
+        while( remainingSize > 0) {
+            downloadedBytes += bytes;
+            downloadProgress = ((double) downloadedBytes / totalFileSize) * 100;
+            int currentChunk = (int) Math.min(bytes, remainingSize);
+            System.out.println("Downloaded: " + downloadedBytes + "/" + totalFileSize + " bytes | Progress: " + downloadProgress + "%");
+            remainingSize -= currentChunk;
+        }
+
 
         HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create(

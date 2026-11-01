@@ -14,7 +14,7 @@ public class RangeRequestDemo {
                 .uri(URI.create(
                     "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf"
                 ))
-                .header("Range", "bytes=0-99")
+                .header("Range", "bytes=1000-1999")
                 .GET()
                 .build();
 
@@ -23,17 +23,14 @@ public class RangeRequestDemo {
                 HttpResponse.BodyHandlers.ofByteArray()
         );
 
-        System.out.println("Status: " + response.statusCode());
+        if(response.statusCode() == 206) {
+            boolean bytesReceived = response.body().length == 1000;
+            if(bytesReceived) {
+                System.out.println("Bytes did received 1000 bytes.");
+            }
+        } else if(response.statusCode() == 200) {
+            System.out.println("Server received the full file.");
+        }
 
-        System.out.println(
-                "Content-Range: " +
-                response.headers()
-                        .firstValue("Content-Range")
-                        .orElse("Not provided")
-        );
-
-        System.out.println(
-                "Bytes received: " + response.body().length
-        );
     }
 }

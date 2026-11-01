@@ -2,3 +2,5 @@ com\downloader\storage\FileCopyDemo.class
 com\downloader\http\HttpClientDemo.class
 com\downloader\Main.class
 com\downloader\http\HttpDownloadDemo.class
+com\downloader\http\RangeRequestDemo.class
+com\downloader\storage\AppendDemo.class

@@ -7,6 +7,8 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -20,10 +22,13 @@ public class DownloadManager {
         new ArrayList<>()
     );
 
+
     private final ExecutorService executorService =
         Executors.newFixedThreadPool(3);
     private final ExecutorCompletionService<String> completionService =
         new ExecutorCompletionService<>(executorService);
+    private final Map<DownloadTask, Future<String>> downloadFutures =
+        new ConcurrentHashMap<>();
 
     // Asynchronous download
     public Future<String> downloadAsync(URI uri, Path path) {
@@ -38,7 +43,11 @@ public class DownloadManager {
                 downloadTask.transitionTo(DownloadState.COMPLETED);
                 return "Download Complete";
             } catch (InterruptedException e) {
-                downloadTask.transitionTo(DownloadState.FAILED);
+                if (downloadTask.isCancellationRequested()) {
+                    downloadTask.transitionTo(DownloadState.CANCELLED);
+                } else {
+                    downloadTask.transitionTo(DownloadState.FAILED);
+                }
                 Thread.currentThread().interrupt();
                 return "Download failed: " + e.getMessage();
             } catch (IOException e) {
@@ -46,10 +55,36 @@ public class DownloadManager {
                 return "Download failed: " + e.getMessage();
             }
         });
+        downloadFutures.put(downloadTask, future);
         return future;
     }
+    public synchronized boolean cancelIfQueued() {
+        if (this.state == DownloadState.QUEUED) {
+            this.state = DownloadState.CANCELLED;
+            return true;
+        }
+        return false;
+    }
 
-    public Future<String> takeCompletedDownload() throws InterruptedException{
+    public boolean cancelDownload(DownloadTask task) {
+        Future<String> future = downloadFutures.get(task);
+
+        if (future == null || future.isDone()) {
+            return false;
+        }
+
+        task.requestCancellation();
+
+        if (!future.cancel(true)) {
+            return false;
+        }
+
+        task.cancelIfQueued();
+
+        return true;
+    }
+
+    public Future<String> takeCompletedDownload() throws InterruptedException {
         return completionService.take();
     }
 
@@ -103,4 +138,5 @@ public class DownloadManager {
             Thread.currentThread().interrupt();
         }
     }
+
 }

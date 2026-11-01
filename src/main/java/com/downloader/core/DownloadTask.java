@@ -13,6 +13,7 @@ public class DownloadTask {
     private final URI uri;
     private final Path destination;
     private DownloadState state;
+    private volatile boolean cancellationRequested = false;
     private static final Map<DownloadState, List<DownloadState>> ALLOWED_TRANSITIONS = Map.of(
            DownloadState.QUEUED,
                List.of(DownloadState.DOWNLOADING, DownloadState.CANCELLED),
@@ -53,7 +54,21 @@ public class DownloadTask {
                 "Invalid transition from " + this.state + " to " + state
             );
         }
+    }
+    public void requestCancellation() {
+        cancellationRequested = true;
+    }
 
+    public boolean isCancellationRequested() {
+        return cancellationRequested;
+    }
+
+    public synchronized boolean cancelIfQueued() {
+        if (this.state == DownloadState.QUEUED) {
+            this.state = DownloadState.CANCELLED;
+            return true;
+        }
+        return false;
     }
 
 }

@@ -1,22 +1,58 @@
 package com.downloader;
 
-import java.io.IOException;
-import java.net.URI;
-import java.nio.file.Path;
-
 import com.downloader.core.DownloadManager;
 
+import java.net.URI;
+import java.nio.file.Path;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
+
 public class Main {
-    public static void main(String[] args) throws IOException, InterruptedException {
-        if(args.length < 2) {
-            System.out.println("Usage: java Main <URL> <destination>");
+
+    public static void main(String[] args) {
+
+        if (args.length < 2 || args.length % 2 != 0) {
+            System.out.println(
+                "Usage: java Main <URL1> <destination1> [<URL2> <destination2> ...]"
+            );
             return;
         }
 
-        URI uri = URI.create(args[0]);
-        Path destination = Path.of(args[1]);
         DownloadManager downloadManager = new DownloadManager();
-        downloadManager.download(uri, destination);
-        downloadManager.printAllTasks();
+
+
+        try {
+            for (int i = 0; i < args.length; i += 2) {
+
+                URI uri = URI.create(args[i]);
+                Path destination = Path.of(args[i + 1]);
+
+                downloadManager.downloadAsync(uri, destination);
+
+                System.out.println("Submitted: " + uri);
+            }
+            int numberOfDownloads = args.length / 2;
+
+            for (int i = 0; i < numberOfDownloads; i++) {
+                try {
+                    Future<String> completed =
+                            downloadManager.takeCompletedDownload();
+
+                    System.out.println(completed.get());
+
+                } catch (ExecutionException e) {
+                    System.err.println(
+                        "Download task failed: " + e.getCause()
+                    );
+                }
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            System.err.println("Main thread interrupted.");
+
+        } finally {
+            downloadManager.shutdownAndAwaitTermination();
+            downloadManager.printAllTasks();
+        }
     }
 }

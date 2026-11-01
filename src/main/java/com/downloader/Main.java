@@ -1,12 +1,13 @@
 package com.downloader;
 
+import java.io.IOException;
 import java.net.URI;
 import java.nio.file.Path;
 
 import com.downloader.core.DownloadManager;
 
 public class Main {
-    public static void main(String[] args) {
+    public static void main(String[] args) throws IOException, InterruptedException {
         if(args.length < 2) {
             System.out.println("Usage: java Main <URL> <destination>");
             return;

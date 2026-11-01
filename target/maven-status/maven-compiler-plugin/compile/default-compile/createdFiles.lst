@@ -1,2 +1,4 @@
-com\downloader\http\HttpDownloadProgressDemo.class
+com\downloader\http\HttpDownloader.class
 com\downloader\Main.class
+com\downloader\http\HttpDownloadProgressDemo.class
+com\downloader\core\DownloadManager.class

@@ -17,5 +17,6 @@ public class Main {
         Path destination = Path.of(args[1]);
         DownloadManager downloadManager = new DownloadManager();
         downloadManager.download(uri, destination);
+        downloadManager.printAllTasks();
     }
 }

@@ -22,7 +22,6 @@ public class DownloadManager {
         new ArrayList<>()
     );
 
-
     private final ExecutorService executorService =
         Executors.newFixedThreadPool(3);
     private final ExecutorCompletionService<String> completionService =
@@ -36,12 +35,19 @@ public class DownloadManager {
         tasks.add(downloadTask);
 
         Future<String> future = completionService.submit(() -> {
-            downloadTask.transitionTo(DownloadState.DOWNLOADING);
-
+            if (!downloadTask.startDownload()) {
+                return "Download Cancelled";
+            }
             try {
                 httpDownloader.download(uri, path);
-                downloadTask.transitionTo(DownloadState.COMPLETED);
-                return "Download Complete";
+
+                if(downloadTask.makeTransferFinished()) {
+                    downloadTask.transitionTo(DownloadState.COMPLETED);
+                    return "Download Complete";
+                }
+
+                downloadTask.transitionTo(DownloadState.CANCELLED);
+                return "Download Cancelled";
             } catch (InterruptedException e) {
                 if (downloadTask.isCancellationRequested()) {
                     downloadTask.transitionTo(DownloadState.CANCELLED);
@@ -51,19 +57,13 @@ public class DownloadManager {
                 Thread.currentThread().interrupt();
                 return "Download failed: " + e.getMessage();
             } catch (IOException e) {
+                e.printStackTrace();
                 downloadTask.transitionTo(DownloadState.FAILED);
-                return "Download failed: " + e.getMessage();
+                return "Download failed: " + e;
             }
         });
         downloadFutures.put(downloadTask, future);
         return future;
-    }
-    public synchronized boolean cancelIfQueued() {
-        if (this.state == DownloadState.QUEUED) {
-            this.state = DownloadState.CANCELLED;
-            return true;
-        }
-        return false;
     }
 
     public boolean cancelDownload(DownloadTask task) {
@@ -73,15 +73,11 @@ public class DownloadManager {
             return false;
         }
 
-        task.requestCancellation();
-
-        if (!future.cancel(true)) {
+        if (!task.requestCancellation()) {
             return false;
         }
 
-        task.cancelIfQueued();
-
-        return true;
+        return future.cancel(true);
     }
 
     public Future<String> takeCompletedDownload() throws InterruptedException {
@@ -138,5 +134,4 @@ public class DownloadManager {
             Thread.currentThread().interrupt();
         }
     }
-
 }

@@ -14,19 +14,32 @@ public class DownloadTask {
     private final Path destination;
     private DownloadState state;
     private volatile boolean cancellationRequested = false;
-    private static final Map<DownloadState, List<DownloadState>> ALLOWED_TRANSITIONS = Map.of(
-           DownloadState.QUEUED,
-               List.of(DownloadState.DOWNLOADING, DownloadState.CANCELLED),
+    private boolean transferFinished = false;
 
-           DownloadState.DOWNLOADING,
-               List.of(DownloadState.COMPLETED, DownloadState.FAILED, DownloadState.CANCELLED),
 
-           DownloadState.COMPLETED, List.of(),
-           DownloadState.FAILED, List.of(),
-           DownloadState.CANCELLED, List.of()
-       );
+    private static final Map<
+        DownloadState,
+        List<DownloadState>
+    > ALLOWED_TRANSITIONS = Map.of(
+        DownloadState.QUEUED,
+        List.of(DownloadState.DOWNLOADING, DownloadState.CANCELLED),
 
-    public DownloadTask(URI uri, Path destination ) {
+        DownloadState.DOWNLOADING,
+        List.of(
+            DownloadState.COMPLETED,
+            DownloadState.FAILED,
+            DownloadState.CANCELLED
+        ),
+
+        DownloadState.COMPLETED,
+        List.of(),
+        DownloadState.FAILED,
+        List.of(),
+        DownloadState.CANCELLED,
+        List.of()
+    );
+
+    public DownloadTask(URI uri, Path destination) {
         this.uri = uri;
         this.destination = destination;
         this.state = DownloadState.QUEUED;
@@ -43,7 +56,8 @@ public class DownloadTask {
     public Path getDestination() {
         return destination;
     }
-    public synchronized void  transitionTo(DownloadState state) {
+
+    public synchronized void transitionTo(DownloadState state) {
         if (state == null) {
             throw new IllegalArgumentException("Download state cannot be null");
         }
@@ -55,20 +69,45 @@ public class DownloadTask {
             );
         }
     }
-    public void requestCancellation() {
+
+    public synchronized boolean requestCancellation() {
+        if (
+            transferFinished ||
+            state == DownloadState.COMPLETED ||
+            state == DownloadState.FAILED ||
+            state == DownloadState.CANCELLED
+        ) {
+            return false;
+        }
+
         cancellationRequested = true;
+
+        if(state == DownloadState.QUEUED) {
+            state = DownloadState.CANCELLED;
+        }
+
+        return true;
+    }
+
+    public synchronized boolean startDownload() {
+        if(state != DownloadState.QUEUED || cancellationRequested) {
+            return false;
+        }
+
+        state = DownloadState.DOWNLOADING;
+        return true;
     }
 
     public boolean isCancellationRequested() {
         return cancellationRequested;
     }
 
-    public synchronized boolean cancelIfQueued() {
-        if (this.state == DownloadState.QUEUED) {
-            this.state = DownloadState.CANCELLED;
-            return true;
+    public synchronized boolean makeTransferFinished() {
+        if(cancellationRequested) {
+            return false;
         }
-        return false;
-    }
 
+        transferFinished = true;
+        return true;
+    }
 }

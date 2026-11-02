@@ -34,7 +34,6 @@ public class HttpDownloader {
                 .uri(task.getUri())
                 .GET();
 
-        // Request only the remaining bytes if a partial file exists.
         if (existingBytes > 0) {
             requestBuilder.header("Range", "bytes=" + existingBytes + "-");
         }
@@ -46,104 +45,155 @@ public class HttpDownloader {
                 HttpResponse.BodyHandlers.ofInputStream()
         );
 
-        int statusCode = response.statusCode();
+        try (InputStream inputStream = response.body()) {
 
-        if (statusCode == 416) {
-            response.body().close();
-            throw new IOException("Requested byte range is not satisfiable.");
-        }
+            int statusCode = response.statusCode();
 
-        if (statusCode != 200 && statusCode != 206) {
-            response.body().close();
-            throw new IOException(
-                    "Download failed. HTTP status: " + statusCode
-            );
-        }
-
-        boolean append;
-
-        if (statusCode == 206) {
-
-            if (existingBytes == 0) {
-                response.body().close();
+            if (statusCode == 416) {
                 throw new IOException(
-                        "Received partial content without requesting a range."
+                        "Requested byte range is not satisfiable."
                 );
             }
 
-            String contentRange = response.headers()
-                    .firstValue("Content-Range")
-                    .orElseThrow(() -> new IOException(
-                            "Missing Content-Range header."
-                    ));
-
-            Matcher matcher = Pattern.compile(
-                    "bytes (\\d+)-(\\d+)/(\\d+|\\*)"
-            ).matcher(contentRange);
-
-            if (!matcher.matches()) {
-                response.body().close();
-                throw new IOException("Invalid Content-Range header.");
-            }
-
-            long rangeStart = Long.parseLong(matcher.group(1));
-
-            if (rangeStart != existingBytes) {
-                response.body().close();
+            if (statusCode != 200 && statusCode != 206) {
                 throw new IOException(
-                        "Server returned an unexpected byte range."
+                        "Download failed. HTTP status: " + statusCode
                 );
             }
 
-            long totalBytes = matcher.group(3).equals("*")
-                    ? -1
-                    : Long.parseLong(matcher.group(3));
+            boolean append = statusCode == 206;
+            long expectedResponseBytes = -1;
+            long totalBytes = -1;
 
-            if (totalBytes > 0) {
-                task.setTotalBytes(totalBytes);
-            } else {
-                long remainingBytes = response.headers()
+            if (append) {
+
+                if (existingBytes == 0) {
+                    throw new IOException(
+                            "Received partial content without requesting a range."
+                    );
+                }
+
+                String contentRange = response.headers()
+                        .firstValue("Content-Range")
+                        .orElseThrow(() -> new IOException(
+                                "Missing Content-Range header."
+                        ));
+
+                Matcher matcher = Pattern.compile(
+                        "bytes (\\d+)-(\\d+)/(\\d+|\\*)"
+                ).matcher(contentRange);
+
+                if (!matcher.matches()) {
+                    throw new IOException("Invalid Content-Range header.");
+                }
+
+                long rangeStart = Long.parseLong(matcher.group(1));
+                long rangeEnd = Long.parseLong(matcher.group(2));
+
+                if (rangeStart != existingBytes) {
+                    throw new IOException(
+                            "Server returned an unexpected range start."
+                    );
+                }
+
+                if (rangeEnd < rangeStart) {
+                    throw new IOException(
+                            "Invalid Content-Range: end is before start."
+                    );
+                }
+
+                expectedResponseBytes = rangeEnd - rangeStart + 1;
+
+                if (!matcher.group(3).equals("*")) {
+                    totalBytes = Long.parseLong(matcher.group(3));
+
+                    if (rangeEnd >= totalBytes) {
+                        throw new IOException(
+                                "Content-Range exceeds the total file size."
+                        );
+                    }
+                }
+
+                long contentLength = response.headers()
                         .firstValueAsLong("Content-Length")
                         .orElse(-1);
 
-                task.setTotalBytes(
-                        remainingBytes > 0
-                                ? existingBytes + remainingBytes
-                                : -1
-                );
+                if (contentLength >= 0
+                        && contentLength != expectedResponseBytes) {
+                    throw new IOException(
+                            "Content-Length does not match Content-Range."
+                    );
+                }
+
+                task.setTotalBytes(totalBytes);
+                task.setDownloadedBytes(existingBytes);
+
+            } else {
+
+                // HTTP 200: start from the beginning.
+                totalBytes = response.headers()
+                        .firstValueAsLong("Content-Length")
+                        .orElse(-1);
+
+                expectedResponseBytes = totalBytes;
+
+                task.setTotalBytes(totalBytes);
+                task.setDownloadedBytes(0);
             }
 
-            task.setDownloadedBytes(existingBytes);
-            append = true;
+            try (OutputStream outputStream = new FileOutputStream(
+                    tempFile.toFile(), append
+            )) {
 
-        } else {
-            task.setTotalBytes(
-                    response.headers()
-                            .firstValueAsLong("Content-Length")
-                            .orElse(-1)
-            );
+                byte[] buffer = new byte[8192];
+                int bytesRead;
 
-            task.setDownloadedBytes(0);
-            append = false;
-        }
+                long responseBytes = 0;
+                long downloadedBytes = task.getDownloadedBytes();
 
-        try (InputStream inputStream = response.body();
-             OutputStream outputStream = new FileOutputStream(
-                     tempFile.toFile(), append
-             )) {
+                while ((bytesRead = inputStream.read(buffer)) != -1) {
 
-            byte[] buffer = new byte[8192];
-            int bytesRead;
-            long downloadedBytes = task.getDownloadedBytes();
+                    // Don't write bytes beyond the advertised range.
+                    if (expectedResponseBytes >= 0
+                            && responseBytes + bytesRead
+                            > expectedResponseBytes) {
+                        throw new IOException(
+                                "Server sent more bytes than advertised."
+                        );
+                    }
 
-            while ((bytesRead = inputStream.read(buffer)) != -1) {
-                outputStream.write(buffer, 0, bytesRead);
+                    outputStream.write(buffer, 0, bytesRead);
 
-                downloadedBytes += bytesRead;
-                task.setDownloadedBytes(downloadedBytes);
+                    responseBytes += bytesRead;
+                    downloadedBytes += bytesRead;
+
+                    task.setDownloadedBytes(downloadedBytes);
+                }
+
+                if (expectedResponseBytes >= 0
+                        && responseBytes != expectedResponseBytes) {
+                    throw new IOException(
+                            "Received fewer bytes than advertised. "
+                                    + "Expected: " + expectedResponseBytes
+                                    + ", received: " + responseBytes
+                    );
+                }
+            }
+
+            // Verify the complete file size when the server provides it.
+            if (totalBytes > 0) {
+                long actualFileSize = Files.size(tempFile);
+
+                if (actualFileSize != totalBytes) {
+                    throw new IOException(
+                            "File size mismatch. Expected: " + totalBytes
+                                    + ", actual: " + actualFileSize
+                    );
+                }
             }
         }
 
+        // Move only after all validation succeeds.
         try {
             Files.move(
                     tempFile,

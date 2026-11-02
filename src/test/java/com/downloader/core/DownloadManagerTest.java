@@ -1,5 +1,6 @@
 package com.downloader.core;
 
+import com.downloader.http.HttpDownloader;
 import com.downloader.storage.DownloadRecord;
 import com.downloader.storage.DownloadRepository;
 import com.downloader.testutil.TestHttpServer;
@@ -9,11 +10,16 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.ByteArrayOutputStream;
+import java.io.PrintStream;
 import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -75,7 +81,7 @@ class DownloadManagerTest {
         Path destination = tempDir.resolve("slow.bin");
 
         manager.downloadAsync(uri, destination);
-        DownloadTask task = manager.getAllTasks().get(0);
+        DownloadTask task = manager.getActiveTasks().get(0);
 
         waitUntil(() -> task.getDownloadedBytes() > 0);
         assertTrue(manager.cancelDownload(task));
@@ -89,6 +95,7 @@ class DownloadManagerTest {
 
         assertEquals(DownloadState.CANCELLED, task.getState());
         assertEquals(DownloadState.CANCELLED, onlyRecord().state());
+        assertEquals(List.of(), manager.getActiveTasks());
         assertTrue(Files.notExists(destination));
     }
 
@@ -126,8 +133,7 @@ class DownloadManagerTest {
         String result = manager.takeCompletedDownload().get();
 
         assertTrue(result.startsWith("Download failed"), result);
-        assertEquals(DownloadState.FAILED,
-                manager.getAllTasks().get(0).getState());
+        assertEquals(List.of(), manager.getActiveTasks());
         manager.shutdownAndAwaitTermination();
         assertEquals(DownloadState.FAILED, onlyRecord().state());
     }
@@ -139,7 +145,7 @@ class DownloadManagerTest {
         Path destination = tempDir.resolve("slow.bin");
 
         manager.downloadAsync(uri, destination);
-        DownloadTask task = manager.getAllTasks().get(0);
+        DownloadTask task = manager.getActiveTasks().get(0);
 
         task.setProgressListener(t -> {
             if (t.getDownloadedBytes() == CONTENT.length) {
@@ -150,6 +156,7 @@ class DownloadManagerTest {
         assertEquals("Download Cancelled",
                 manager.takeCompletedDownload().get());
         assertEquals(DownloadState.CANCELLED, task.getState());
+        assertEquals(DownloadState.CANCELLED, onlyRecord().state());
         assertTrue(Files.notExists(destination));
     }
 
@@ -167,6 +174,92 @@ class DownloadManagerTest {
         }
 
         assertEquals(0, manager.activeDownloadCount());
+        assertEquals(List.of(), manager.getActiveTasks());
+    }
+
+    @Test
+    void stateChangeIsPersistedThroughTheStateListener() throws Exception {
+        CountDownLatch release = new CountDownLatch(1);
+        DownloadManager blocked = managerWithBlockedWorker(release);
+
+        try {
+            blocked.downloadAsync(server.serve("/file", CONTENT),
+                    tempDir.resolve("file.bin"));
+            DownloadTask task = blocked.getActiveTasks().get(0);
+            assertEquals(DownloadState.QUEUED, onlyRecord().state());
+
+            task.transitionTo(DownloadState.DOWNLOADING);
+            assertEquals(DownloadState.DOWNLOADING, onlyRecord().state());
+
+            task.transitionTo(DownloadState.FAILED);
+            assertEquals(DownloadState.FAILED, onlyRecord().state());
+            assertEquals(List.of(), blocked.getActiveTasks());
+        } finally {
+            release.countDown();
+            blocked.shutdownAndAwaitTermination();
+        }
+    }
+
+    @Test
+    void cancellingQueuedDownloadIsPersistedAndDropped() throws Exception {
+        CountDownLatch release = new CountDownLatch(1);
+        DownloadManager blocked = managerWithBlockedWorker(release);
+
+        try {
+            blocked.downloadAsync(server.serve("/file", CONTENT),
+                    tempDir.resolve("file.bin"));
+            DownloadTask task = blocked.getActiveTasks().get(0);
+
+            assertTrue(blocked.cancelDownload(task));
+
+            assertEquals(DownloadState.CANCELLED, task.getState());
+            assertEquals(DownloadState.CANCELLED, onlyRecord().state());
+            assertEquals(List.of(), blocked.getActiveTasks());
+
+            release.countDown();
+            assertTrue(blocked.takeCompletedDownload().isCancelled());
+        } finally {
+            release.countDown();
+            blocked.shutdownAndAwaitTermination();
+        }
+
+        assertEquals(List.of(), server.rangeHeaders());
+    }
+
+    @Test
+    void printDownloadProgressShowsOnlyRunningDownloads() throws Exception {
+        URI uri = server.serveSlowly("/slow", CONTENT, 10_000, 30);
+
+        manager.downloadAsync(uri, tempDir.resolve("slow.bin"));
+        DownloadTask task = manager.getActiveTasks().get(0);
+        waitUntil(() -> task.getDownloadedBytes() > 0);
+
+        assertTrue(captureProgress().startsWith("slow.bin | "));
+
+        assertEquals("Download Complete",
+                manager.takeCompletedDownload().get());
+        assertEquals("", captureProgress());
+    }
+
+    private DownloadManager managerWithBlockedWorker(CountDownLatch release) {
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        executor.submit(() -> {
+            release.await();
+            return null;
+        });
+        return new DownloadManager(new HttpDownloader(), repository, executor);
+    }
+
+    private String captureProgress() {
+        PrintStream original = System.out;
+        ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+        System.setOut(new PrintStream(buffer, true));
+        try {
+            manager.printDownloadProgress();
+        } finally {
+            System.setOut(original);
+        }
+        return buffer.toString();
     }
 
     @Test

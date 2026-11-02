@@ -14,6 +14,7 @@ public class DownloadTask {
     private final Path destination;
 
     private volatile Consumer<DownloadTask> progressListener;
+    private volatile StateListener stateListener;
 
     private volatile long downloadedBytes;
     private volatile long totalBytes = -1;
@@ -81,6 +82,10 @@ public class DownloadTask {
         this.progressListener = progressListener;
     }
 
+    public void setStateListener(StateListener stateListener) {
+        this.stateListener = stateListener;
+    }
+
     public synchronized DownloadState getState() {
         return state;
     }
@@ -101,13 +106,13 @@ public class DownloadTask {
             );
         }
 
-        if (ALLOWED_TRANSITIONS.get(state).contains(newState)) {
-            state = newState;
-        } else {
+        if (!ALLOWED_TRANSITIONS.get(state).contains(newState)) {
             throw new IllegalStateException(
                 "Invalid state transition: " + state + " -> " + newState
             );
         }
+
+        changeState(newState);
     }
 
     public synchronized boolean startDownload() {
@@ -116,24 +121,22 @@ public class DownloadTask {
             return false;
         }
 
-        state = DownloadState.DOWNLOADING;
+        changeState(DownloadState.DOWNLOADING);
         return true;
     }
 
     public synchronized boolean requestCancellation() {
 
-        if (transferFinished ||
-            state == DownloadState.COMPLETED ||
-            state == DownloadState.FAILED ||
-            state == DownloadState.CANCELLED) {
-
+        if (transferFinished || state.isFinished()) {
             return false;
         }
 
         cancellationRequested = true;
 
         if (state == DownloadState.QUEUED) {
-            state = DownloadState.CANCELLED;
+            changeState(DownloadState.CANCELLED);
+        } else {
+            notifyStateListener(DownloadState.CANCELLED);
         }
 
         return true;
@@ -147,6 +150,18 @@ public class DownloadTask {
 
         transferFinished = true;
         return true;
+    }
+
+    private void changeState(DownloadState newState) {
+        state = newState;
+        notifyStateListener(newState);
+    }
+
+    private void notifyStateListener(DownloadState reportedState) {
+        StateListener listener = stateListener;
+        if (listener != null) {
+            listener.stateChanged(this, reportedState);
+        }
     }
 
     public boolean isCancellationRequested() {

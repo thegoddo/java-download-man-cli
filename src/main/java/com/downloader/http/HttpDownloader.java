@@ -1,11 +1,10 @@
 package com.downloader.http;
 
-import com.downloader.core.DownloadTask;
-
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
@@ -25,17 +24,10 @@ public class HttpDownloader {
             .followRedirects(HttpClient.Redirect.NORMAL)
             .build();
 
-    public void download(DownloadTask task)
+    public Path downloadToPart(
+            URI uri, Path destination, TransferListener listener)
             throws IOException, InterruptedException {
 
-        Path tempFile = downloadToPart(task);
-        moveIntoPlace(tempFile, task.getDestination());
-    }
-
-    public Path downloadToPart(DownloadTask task)
-            throws IOException, InterruptedException {
-
-        Path destination = task.getDestination();
         Path tempFile = Path.of(destination.toString() + ".part");
 
         Path folder = destination.toAbsolutePath().getParent();
@@ -52,7 +44,7 @@ public class HttpDownloader {
                 : 0;
 
         HttpRequest.Builder requestBuilder = HttpRequest.newBuilder()
-                .uri(task.getUri())
+                .uri(uri)
                 .GET();
 
         if (existingBytes > 0) {
@@ -74,8 +66,7 @@ public class HttpDownloader {
                 long totalBytes = parseUnsatisfiedRangeTotal(response);
 
                 if (totalBytes >= 0 && existingBytes == totalBytes) {
-                    task.setTotalBytes(totalBytes);
-                    task.setDownloadedBytes(totalBytes);
+                    listener.onStart(totalBytes, totalBytes);
                     return tempFile;
                 }
 
@@ -158,8 +149,7 @@ public class HttpDownloader {
                     );
                 }
 
-                task.setTotalBytes(totalBytes);
-                task.setDownloadedBytes(existingBytes);
+                listener.onStart(existingBytes, totalBytes);
 
             } else {
 
@@ -170,8 +160,7 @@ public class HttpDownloader {
 
                 expectedResponseBytes = totalBytes;
 
-                task.setTotalBytes(totalBytes);
-                task.setDownloadedBytes(0);
+                listener.onStart(0, totalBytes);
             }
 
             try (OutputStream outputStream = new FileOutputStream(
@@ -182,11 +171,11 @@ public class HttpDownloader {
                 int bytesRead;
 
                 long responseBytes = 0;
-                long downloadedBytes = task.getDownloadedBytes();
+                long downloadedBytes = append ? existingBytes : 0;
 
                 while ((bytesRead = inputStream.read(buffer)) != -1) {
 
-                    if (task.isCancellationRequested()) {
+                    if (listener.isCancelled()) {
                         throw new IOException("Download cancelled.");
                     }
 
@@ -204,7 +193,7 @@ public class HttpDownloader {
                     responseBytes += bytesRead;
                     downloadedBytes += bytesRead;
 
-                    task.setDownloadedBytes(downloadedBytes);
+                    listener.onProgress(downloadedBytes);
                 }
 
                 if (expectedResponseBytes >= 0

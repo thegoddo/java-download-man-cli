@@ -6,5 +6,9 @@ public enum DownloadState {
 	DOWNLOADING,
 	COMPLETED,
 	FAILED,
-	CANCELLED
+	CANCELLED;
+
+	public boolean isFinished() {
+		return this == COMPLETED || this == FAILED || this == CANCELLED;
+	}
 }

@@ -4,6 +4,8 @@ import org.junit.jupiter.api.Test;
 
 import java.net.URI;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -106,6 +108,40 @@ class DownloadTaskTest {
 
         assertTrue(task.markTransferFinished());
         assertFalse(task.requestCancellation());
+    }
+
+    @Test
+    void everyStateChangeNotifiesTheStateListener() {
+        List<DownloadState> reported = new ArrayList<>();
+
+        DownloadTask completed = newTask();
+        completed.setStateListener((t, state) -> reported.add(state));
+        completed.startDownload();
+        completed.markTransferFinished();
+        completed.transitionTo(DownloadState.COMPLETED);
+
+        assertEquals(List.of(DownloadState.DOWNLOADING,
+                DownloadState.COMPLETED), reported);
+
+        reported.clear();
+        DownloadTask queued = newTask();
+        queued.setStateListener((t, state) -> reported.add(t.getState()));
+        queued.requestCancellation();
+
+        assertEquals(List.of(DownloadState.CANCELLED), reported);
+    }
+
+    @Test
+    void cancellingRunningTaskReportsCancelledBeforeStateChanges() {
+        List<DownloadState> reported = new ArrayList<>();
+        DownloadTask task = newTask();
+        task.startDownload();
+        task.setStateListener((t, state) -> reported.add(state));
+
+        task.requestCancellation();
+
+        assertEquals(List.of(DownloadState.CANCELLED), reported);
+        assertEquals(DownloadState.DOWNLOADING, task.getState());
     }
 
     @Test

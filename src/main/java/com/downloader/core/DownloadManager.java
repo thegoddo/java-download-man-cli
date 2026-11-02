@@ -18,34 +18,51 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 
 public class DownloadManager {
+
+    private static final int DEFAULT_PARALLEL_DOWNLOADS = 3;
 
     private static final long PROGRESS_SAVE_INTERVAL_NANOS =
             TimeUnit.SECONDS.toNanos(1);
     private static final long PROGRESS_SAVE_BYTES = 4 * 1024 * 1024;
 
-    private final HttpDownloader httpDownloader = new HttpDownloader();
+    private final HttpDownloader httpDownloader;
 
     private final DownloadRepository repository;
+
+    private final ExecutorService executorService;
+
+    private final ExecutorCompletionService<String> completionService;
 
     private final Map<Future<String>, DownloadTask> futureToTask =
             new ConcurrentHashMap<>();
 
-    private final List<DownloadTask> tasks =
-            Collections.synchronizedList(new ArrayList<>());
-
-    private final ExecutorService executorService =
-            Executors.newFixedThreadPool(3);
-
-    private final ExecutorCompletionService<String> completionService =
-            new ExecutorCompletionService<>(executorService);
-
     private final Map<DownloadTask, Future<String>> downloadFutures =
             new ConcurrentHashMap<>();
 
+    private final List<DownloadTask> activeTasks =
+            Collections.synchronizedList(new ArrayList<>());
+
     public DownloadManager(DownloadRepository repository) {
+        this(
+                new HttpDownloader(),
+                repository,
+                Executors.newFixedThreadPool(DEFAULT_PARALLEL_DOWNLOADS)
+        );
+    }
+
+    public DownloadManager(
+            HttpDownloader httpDownloader,
+            DownloadRepository repository,
+            ExecutorService executorService) {
+
+        this.httpDownloader = httpDownloader;
         this.repository = repository;
+        this.executorService = executorService;
+        this.completionService =
+                new ExecutorCompletionService<>(executorService);
     }
 
     // Asynchronous download
@@ -125,16 +142,12 @@ public class DownloadManager {
 
     private Future<String> submit(DownloadTask downloadTask) {
 
-        tasks.add(downloadTask);
-        saveProgressThrottled(downloadTask);
+        activeTasks.add(downloadTask);
+        downloadTask.setStateListener(this::onStateChanged);
+        downloadTask.setProgressListener(throttledProgressSaver());
 
-        Future<String> future = completionService.submit(() -> {
-            try {
-                return runDownload(downloadTask);
-            } finally {
-                saveTask(downloadTask);
-            }
-        });
+        Future<String> future =
+                completionService.submit(() -> runDownload(downloadTask));
 
         downloadFutures.put(downloadTask, future);
         futureToTask.put(future, downloadTask);
@@ -144,16 +157,16 @@ public class DownloadManager {
 
     private String runDownload(DownloadTask downloadTask) {
 
-        synchronized (this) {
-            if (!downloadTask.startDownload()) {
-                return "Download Cancelled";
-            }
-
-            saveTask(downloadTask);
+        if (!downloadTask.startDownload()) {
+            return "Download Cancelled";
         }
 
         try {
-            Path partFile = httpDownloader.downloadToPart(downloadTask);
+            Path partFile = httpDownloader.downloadToPart(
+                    downloadTask.getUri(),
+                    downloadTask.getDestination(),
+                    new TaskTransferListener(downloadTask)
+            );
 
             if (!downloadTask.markTransferFinished()) {
                 downloadTask.transitionTo(DownloadState.CANCELLED);
@@ -217,8 +230,6 @@ public class DownloadManager {
             return false;
         }
 
-        saveCancelled(task);
-
         boolean cancelled = future.cancel(true);
 
         return cancelled || task.getState() == DownloadState.CANCELLED;
@@ -241,47 +252,10 @@ public class DownloadManager {
         return completedFuture;
     }
 
-    // Synchronous download
-    public void download(DownloadTask task)
-            throws IOException, InterruptedException {
+    public List<DownloadTask> getActiveTasks() {
 
-        task.transitionTo(DownloadState.DOWNLOADING);
-        tasks.add(task);
-
-        if (task.getId() < 0) {
-            saveNewTask(task);
-        } else {
-            saveTask(task);
-        }
-        saveProgressThrottled(task);
-
-        try {
-            try {
-                httpDownloader.download(task);
-
-            } catch (InterruptedException e) {
-
-                task.transitionTo(DownloadState.FAILED);
-                Thread.currentThread().interrupt();
-                throw e;
-
-            } catch (IOException | RuntimeException e) {
-
-                task.transitionTo(DownloadState.FAILED);
-                throw e;
-            }
-
-            task.transitionTo(DownloadState.COMPLETED);
-
-        } finally {
-            saveTask(task);
-        }
-    }
-
-    public List<DownloadTask> getAllTasks() {
-
-        synchronized (tasks) {
-            return List.copyOf(tasks);
+        synchronized (activeTasks) {
+            return List.copyOf(activeTasks);
         }
     }
 
@@ -333,7 +307,7 @@ public class DownloadManager {
     }
 
     public void printDownloadProgress() {
-        for (DownloadTask task : getAllTasks()) {
+        for (DownloadTask task : getActiveTasks()) {
             if (task.getState() == DownloadState.DOWNLOADING) {
                 System.out.printf(
                     "%s | %.2f%% | %d / %d bytes%n",
@@ -343,6 +317,14 @@ public class DownloadManager {
                     task.getTotalBytes()
                 );
             }
+        }
+    }
+
+    private void onStateChanged(DownloadTask task, DownloadState state) {
+        saveState(task, state);
+
+        if (task.getState().isFinished()) {
+            activeTasks.remove(task);
         }
     }
 
@@ -359,7 +341,7 @@ public class DownloadManager {
         }
     }
 
-    private void saveTask(DownloadTask task) {
+    private void saveState(DownloadTask task, DownloadState state) {
         if (task.getId() < 0) {
             return;
         }
@@ -367,7 +349,7 @@ public class DownloadManager {
         try {
             repository.update(
                     task.getId(),
-                    task.getState(),
+                    state,
                     task.getDownloadedBytes(),
                     task.getTotalBytes()
             );
@@ -379,33 +361,18 @@ public class DownloadManager {
         }
     }
 
-    private void saveCancelled(DownloadTask task) {
-        if (task.getId() < 0) {
-            return;
-        }
-
-        try {
-            repository.updateState(task.getId(), DownloadState.CANCELLED);
-        } catch (SQLException e) {
-            System.err.println(
-                    "Could not update download " + task.getId()
-                            + ": " + e.getMessage()
-            );
-        }
-    }
-
-    private void saveProgressThrottled(DownloadTask task) {
+    private Consumer<DownloadTask> throttledProgressSaver() {
 
         long[] lastSaveTime = {0};
         long[] lastSavedBytes = {-1};
 
-        task.setProgressListener(t -> {
-            if (t.getId() < 0) {
+        return task -> {
+            if (task.getId() < 0) {
                 return;
             }
 
             long now = System.nanoTime();
-            long bytes = t.getDownloadedBytes();
+            long bytes = task.getDownloadedBytes();
 
             boolean firstSave = lastSavedBytes[0] < 0;
             boolean timeElapsed =
@@ -421,13 +388,13 @@ public class DownloadManager {
             lastSavedBytes[0] = bytes;
 
             try {
-                repository.updateProgress(t.getId(), bytes, t.getTotalBytes());
+                repository.updateProgress(task.getId(), bytes, task.getTotalBytes());
             } catch (SQLException e) {
                 System.err.println(
-                        "Could not save progress for download " + t.getId()
+                        "Could not save progress for download " + task.getId()
                                 + ": " + e.getMessage()
                 );
             }
-        });
+        };
     }
 }

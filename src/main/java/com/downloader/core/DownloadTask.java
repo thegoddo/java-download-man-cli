@@ -4,11 +4,16 @@ import java.net.URI;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Consumer;
 
 public class DownloadTask {
 
+    private volatile long id = -1;
+
     private final URI uri;
     private final Path destination;
+
+    private volatile Consumer<DownloadTask> progressListener;
 
     private volatile long downloadedBytes;
     private volatile long totalBytes = -1;
@@ -51,6 +56,35 @@ public class DownloadTask {
         this.uri = uri;
         this.destination = destination;
         this.state = DownloadState.QUEUED;
+    }
+
+    // Rebuilds a task from a stored record. It always starts in QUEUED,
+    // even if the record was left DOWNLOADING or FAILED by an earlier run,
+    // so it goes through the normal state machine again.
+    public static DownloadTask restore(
+            long id, URI uri, Path destination,
+            long downloadedBytes, long totalBytes) {
+
+        DownloadTask task = new DownloadTask(uri, destination);
+        task.id = id;
+        task.downloadedBytes = downloadedBytes;
+        task.totalBytes = totalBytes;
+        return task;
+    }
+
+    // Database id, or -1 if the task has not been saved.
+    public long getId() {
+        return id;
+    }
+
+    public void setId(long id) {
+        this.id = id;
+    }
+
+    // Called (on the download thread) every time the downloaded byte
+    // count changes.
+    public void setProgressListener(Consumer<DownloadTask> progressListener) {
+        this.progressListener = progressListener;
     }
 
     public synchronized DownloadState getState() {
@@ -130,6 +164,11 @@ public class DownloadTask {
 
     public void setDownloadedBytes(long downloadedBytes) {
         this.downloadedBytes = downloadedBytes;
+
+        Consumer<DownloadTask> listener = progressListener;
+        if (listener != null) {
+            listener.accept(this);
+        }
     }
 
     public long getTotalBytes() {

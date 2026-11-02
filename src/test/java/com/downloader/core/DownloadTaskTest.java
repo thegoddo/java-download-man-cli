@@ -56,14 +56,12 @@ class DownloadTaskTest {
     void invalidTransitionsThrow() {
         DownloadTask task = newTask();
 
-        // Cannot skip DOWNLOADING.
         assertThrows(IllegalStateException.class,
                 () -> task.transitionTo(DownloadState.COMPLETED));
 
         task.transitionTo(DownloadState.DOWNLOADING);
         task.transitionTo(DownloadState.COMPLETED);
 
-        // Terminal states are final.
         assertThrows(IllegalStateException.class,
                 () -> task.transitionTo(DownloadState.DOWNLOADING));
         assertEquals(DownloadState.COMPLETED, task.getState());
@@ -86,7 +84,6 @@ class DownloadTaskTest {
         assertEquals(DownloadState.CANCELLED, task.getState());
         assertTrue(task.isCancellationRequested());
 
-        // A cancelled task never starts and cannot be cancelled again.
         assertFalse(task.startDownload());
         assertFalse(task.requestCancellation());
     }
@@ -98,7 +95,6 @@ class DownloadTaskTest {
 
         assertTrue(task.requestCancellation());
 
-        // The download thread decides the final state.
         assertEquals(DownloadState.DOWNLOADING, task.getState());
         assertFalse(task.markTransferFinished());
     }

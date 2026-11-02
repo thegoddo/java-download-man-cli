@@ -20,7 +20,6 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-// End-to-end tests: manager + HttpDownloader + SQLite + a local server.
 @Timeout(10)
 class DownloadManagerTest {
 
@@ -42,7 +41,6 @@ class DownloadManagerTest {
 
     @AfterEach
     void tearDown() throws Exception {
-        // Close the server first so a still-running slow download ends.
         server.close();
         manager.shutdownAndAwaitTermination();
         repository.close();
@@ -73,7 +71,6 @@ class DownloadManagerTest {
 
     @Test
     void cancellingSlowDownloadEndsCancelled() throws Exception {
-        // About 6 seconds in total if nobody cancels it.
         URI uri = server.serveSlowly("/slow", CONTENT, 1_000, 60);
         Path destination = tempDir.resolve("slow.bin");
 
@@ -86,8 +83,8 @@ class DownloadManagerTest {
         Future<String> completed = manager.takeCompletedDownload();
         assertTrue(completed.isCancelled());
 
-        // future.cancel() returns before the worker has finished;
-        // wait for it so the final state has been written.
+        assertEquals(DownloadState.CANCELLED, onlyRecord().state());
+
         manager.shutdownAndAwaitTermination();
 
         assertEquals(DownloadState.CANCELLED, task.getState());
@@ -101,7 +98,6 @@ class DownloadManagerTest {
         Path destination = tempDir.resolve("file.bin");
         int alreadyHave = 30_000;
 
-        // State left behind by a run that crashed mid-download.
         long id = repository.insert(uri, destination, DownloadState.DOWNLOADING);
         repository.updateProgress(id, alreadyHave, CONTENT.length);
         Files.write(Path.of(destination + ".part"),
@@ -122,7 +118,85 @@ class DownloadManagerTest {
         assertEquals(CONTENT.length, record.downloadedBytes());
     }
 
-    // Polls a condition for up to 5 seconds.
+    @Test
+    void runtimeExceptionInWorkerEndsFailed() throws Exception {
+        URI uri = URI.create("ftp://example.com/file.bin");
+
+        manager.downloadAsync(uri, tempDir.resolve("file.bin"));
+        String result = manager.takeCompletedDownload().get();
+
+        assertTrue(result.startsWith("Download failed"), result);
+        assertEquals(DownloadState.FAILED,
+                manager.getAllTasks().get(0).getState());
+        manager.shutdownAndAwaitTermination();
+        assertEquals(DownloadState.FAILED, onlyRecord().state());
+    }
+
+    @Test
+    void cancelAfterLastByteNeverLeavesFinishedFileCancelled()
+            throws Exception {
+        URI uri = server.serveSlowly("/slow", CONTENT, 10_000, 30);
+        Path destination = tempDir.resolve("slow.bin");
+
+        manager.downloadAsync(uri, destination);
+        DownloadTask task = manager.getAllTasks().get(0);
+
+        task.setProgressListener(t -> {
+            if (t.getDownloadedBytes() == CONTENT.length) {
+                t.requestCancellation();
+            }
+        });
+
+        assertEquals("Download Cancelled",
+                manager.takeCompletedDownload().get());
+        assertEquals(DownloadState.CANCELLED, task.getState());
+        assertTrue(Files.notExists(destination));
+    }
+
+    @Test
+    void manyFastDownloadsLeaveNoStaleEntries() throws Exception {
+        URI uri = server.serve("/tiny", TestHttpServer.content(10));
+        int count = 30;
+
+        for (int i = 0; i < count; i++) {
+            manager.downloadAsync(uri, tempDir.resolve("tiny" + i + ".bin"));
+        }
+        for (int i = 0; i < count; i++) {
+            assertEquals("Download Complete",
+                    manager.takeCompletedDownload().get());
+        }
+
+        assertEquals(0, manager.activeDownloadCount());
+    }
+
+    @Test
+    void resumingTwiceSubmitsEachDownloadOnce() throws Exception {
+        URI uri = server.serveSlowly("/slow", CONTENT, 10_000, 30);
+        Path destination = tempDir.resolve("slow.bin");
+        repository.insert(uri, destination, DownloadState.DOWNLOADING);
+
+        assertEquals(1, manager.resumeDownloads().size());
+        assertEquals(0, manager.resumeDownloads().size());
+
+        assertEquals("Download Complete",
+                manager.takeCompletedDownload().get());
+        assertEquals(1, server.rangeHeaders().size());
+    }
+
+    @Test
+    void resumeSkipsFailedUnlessAsked() throws Exception {
+        URI uri = server.serve("/file", CONTENT);
+        Path destination = tempDir.resolve("file.bin");
+        repository.insert(uri, destination, DownloadState.FAILED);
+
+        assertEquals(List.of(), manager.resumeDownloads());
+        assertEquals(1, manager.resumeDownloads(true).size());
+
+        assertEquals("Download Complete",
+                manager.takeCompletedDownload().get());
+        assertEquals(DownloadState.COMPLETED, onlyRecord().state());
+    }
+
     private static void waitUntil(java.util.function.BooleanSupplier condition)
             throws InterruptedException {
         long deadline = System.nanoTime() + 5_000_000_000L;

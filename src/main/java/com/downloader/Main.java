@@ -3,6 +3,7 @@ package com.downloader;
 import com.downloader.core.DownloadManager;
 import com.downloader.storage.DownloadRepository;
 import java.net.URI;
+import java.net.URISyntaxException;
 import java.nio.file.Path;
 import java.sql.SQLException;
 import java.util.List;
@@ -19,12 +20,26 @@ public class Main {
 
     public static void main(String[] args) {
         boolean history = args.length == 1 && args[0].equals("history");
-        boolean resume = args.length == 1 && args[0].equals("resume");
+        boolean resumeFailed = args.length == 2 && args[0].equals("resume")
+                && args[1].equals("--failed");
+        boolean resume = (args.length == 1 && args[0].equals("resume"))
+                || resumeFailed;
 
         if (!history && !resume
                 && (args.length < 2 || args.length % 2 != 0)) {
             printUsage();
             return;
+        }
+
+        if (!history && !resume) {
+            for (int i = 0; i < args.length; i += 2) {
+                try {
+                    parseUrl(args[i]);
+                } catch (IllegalArgumentException e) {
+                    System.err.println(e.getMessage());
+                    return;
+                }
+            }
         }
 
         try (DownloadRepository repository =
@@ -35,7 +50,7 @@ public class Main {
             if (history) {
                 downloadManager.printAllTasks();
             } else {
-                runDownloads(downloadManager, args, resume);
+                runDownloads(downloadManager, args, resume, resumeFailed);
             }
         } catch (SQLException e) {
             System.err.println("Database error: " + e.getMessage());
@@ -45,13 +60,41 @@ public class Main {
     private static void printUsage() {
         System.out.println(
             "Usage: java Main <URL1> <destination1> [<URL2> <destination2> ...]\n"
-                + "       java Main resume     (continue unfinished downloads)\n"
-                + "       java Main history    (show all downloads)"
+                + "       java Main resume           (continue queued or interrupted downloads)\n"
+                + "       java Main resume --failed  (same, and also retry failed downloads)\n"
+                + "       java Main history          (show all downloads)\n"
+                + "Destination folders must already exist; they are never created."
         );
     }
 
+    static URI parseUrl(String text) {
+        URI uri;
+
+        try {
+            uri = new URI(text);
+        } catch (URISyntaxException e) {
+            throw new IllegalArgumentException(
+                "Invalid URL '" + text + "': " + e.getReason()
+            );
+        }
+
+        String scheme = uri.getScheme();
+        boolean http = "http".equalsIgnoreCase(scheme)
+            || "https".equalsIgnoreCase(scheme);
+
+        if (!http || uri.getHost() == null) {
+            throw new IllegalArgumentException(
+                "Invalid URL '" + text
+                    + "': expected an absolute http:// or https:// URL."
+            );
+        }
+
+        return uri;
+    }
+
     private static void runDownloads(
-        DownloadManager downloadManager, String[] args, boolean resume) {
+        DownloadManager downloadManager, String[] args,
+        boolean resume, boolean resumeFailed) {
 
         ScheduledExecutorService scheduler =
             Executors.newSingleThreadScheduledExecutor();
@@ -66,9 +109,8 @@ public class Main {
             int numberOfDownloads;
 
             if (resume) {
-                // Re-submit unfinished downloads from the database
                 List<Future<String>> resumed =
-                    downloadManager.resumeDownloads();
+                    downloadManager.resumeDownloads(resumeFailed);
 
                 numberOfDownloads = resumed.size();
                 System.out.println("Resuming " + numberOfDownloads
@@ -76,7 +118,7 @@ public class Main {
             } else {
                 // Submit downloads
                 for (int i = 0; i < args.length; i += 2) {
-                    URI uri = URI.create(args[i]);
+                    URI uri = parseUrl(args[i]);
                     Path destination = Path.of(args[i + 1]);
 
                     downloadManager.downloadAsync(uri, destination);
@@ -104,9 +146,12 @@ public class Main {
             Thread.currentThread().interrupt();
             System.err.println("Main thread interrupted.");
         } finally {
-            downloadManager.shutdownAndAwaitTermination();
-            downloadManager.printAllTasks();
+            try {
+                downloadManager.shutdownAndAwaitTermination();
+                downloadManager.printAllTasks();
+            } finally {
+                scheduler.shutdown();
+            }
         }
-        scheduler.shutdown();
     }
 }

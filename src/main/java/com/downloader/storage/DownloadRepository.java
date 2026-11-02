@@ -14,9 +14,6 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 
-// Stores download records in a SQLite database.
-// Uses a single connection; every method is synchronized so the
-// worker threads never use the connection at the same time.
 public class DownloadRepository implements AutoCloseable {
 
     private final Connection connection;
@@ -26,6 +23,11 @@ public class DownloadRepository implements AutoCloseable {
         connection = DriverManager.getConnection(
                 "jdbc:sqlite:" + databaseFile.toAbsolutePath()
         );
+
+        try (Statement statement = connection.createStatement()) {
+            statement.execute("PRAGMA busy_timeout = 5000");
+            statement.execute("PRAGMA journal_mode = WAL");
+        }
 
         createSchema();
     }
@@ -48,7 +50,6 @@ public class DownloadRepository implements AutoCloseable {
         }
     }
 
-    // Inserts a new record and returns its generated id.
     public synchronized long insert(
             URI uri, Path destination, DownloadState state)
             throws SQLException {
@@ -106,19 +107,53 @@ public class DownloadRepository implements AutoCloseable {
         }
     }
 
+    public synchronized void update(
+            long id, DownloadState state,
+            long downloadedBytes, long totalBytes)
+            throws SQLException {
+
+        try (PreparedStatement statement = connection.prepareStatement(
+                "UPDATE downloads SET state = ?, downloaded_bytes = ?, "
+                        + "total_bytes = ?, updated_at = ? WHERE id = ?"
+        )) {
+            statement.setString(1, state.name());
+            statement.setLong(2, downloadedBytes);
+            statement.setLong(3, totalBytes);
+            statement.setString(4, Instant.now().toString());
+            statement.setLong(5, id);
+            statement.executeUpdate();
+        }
+    }
+
+    public synchronized boolean claimForResume(DownloadRecord record)
+            throws SQLException {
+
+        try (PreparedStatement statement = connection.prepareStatement(
+                "UPDATE downloads SET state = 'QUEUED', updated_at = ? "
+                        + "WHERE id = ? AND state = ? AND updated_at = ?"
+        )) {
+            statement.setString(1, Instant.now().toString());
+            statement.setLong(2, record.id());
+            statement.setString(3, record.state().name());
+            statement.setString(4, record.updatedAt());
+            return statement.executeUpdate() == 1;
+        }
+    }
+
     public synchronized List<DownloadRecord> findAll() throws SQLException {
         return query("SELECT * FROM downloads ORDER BY id");
     }
 
-    // Downloads that did not finish: still queued, interrupted by a
-    // crash (left in DOWNLOADING), or failed.
-    public synchronized List<DownloadRecord> findResumable()
-            throws SQLException {
+    public synchronized List<DownloadRecord> findResumable(
+            boolean includeFailed) throws SQLException {
+
+        String states = includeFailed
+                ? "('QUEUED', 'DOWNLOADING', 'FAILED')"
+                : "('QUEUED', 'DOWNLOADING')";
 
         return query(
-                "SELECT * FROM downloads "
-                        + "WHERE state IN ('QUEUED', 'DOWNLOADING', 'FAILED') "
-                        + "ORDER BY id"
+                "SELECT * FROM downloads WHERE state IN " + states
+                        + " ORDER BY id"
         );
     }
 
@@ -130,16 +165,21 @@ public class DownloadRepository implements AutoCloseable {
              ResultSet rs = statement.executeQuery(sql)) {
 
             while (rs.next()) {
-                records.add(new DownloadRecord(
-                        rs.getLong("id"),
-                        URI.create(rs.getString("uri")),
-                        Path.of(rs.getString("destination")),
-                        DownloadState.valueOf(rs.getString("state")),
-                        rs.getLong("downloaded_bytes"),
-                        rs.getLong("total_bytes"),
-                        rs.getString("created_at"),
-                        rs.getString("updated_at")
-                ));
+                try {
+                    records.add(new DownloadRecord(
+                            rs.getLong("id"),
+                            URI.create(rs.getString("uri")),
+                            Path.of(rs.getString("destination")),
+                            DownloadState.valueOf(rs.getString("state")),
+                            rs.getLong("downloaded_bytes"),
+                            rs.getLong("total_bytes"),
+                            rs.getString("created_at"),
+                            rs.getString("updated_at")
+                    ));
+                } catch (IllegalArgumentException e) {
+                    System.err.println("Skipping download " + rs.getLong("id")
+                            + " with invalid data: " + e.getMessage());
+                }
             }
         }
 

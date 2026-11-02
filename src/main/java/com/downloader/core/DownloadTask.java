@@ -58,9 +58,6 @@ public class DownloadTask {
         this.state = DownloadState.QUEUED;
     }
 
-    // Rebuilds a task from a stored record. It always starts in QUEUED,
-    // even if the record was left DOWNLOADING or FAILED by an earlier run,
-    // so it goes through the normal state machine again.
     public static DownloadTask restore(
             long id, URI uri, Path destination,
             long downloadedBytes, long totalBytes) {
@@ -72,7 +69,6 @@ public class DownloadTask {
         return task;
     }
 
-    // Database id, or -1 if the task has not been saved.
     public long getId() {
         return id;
     }
@@ -81,8 +77,6 @@ public class DownloadTask {
         this.id = id;
     }
 
-    // Called (on the download thread) every time the downloaded byte
-    // count changes.
     public void setProgressListener(Consumer<DownloadTask> progressListener) {
         this.progressListener = progressListener;
     }

@@ -28,3 +28,10 @@ sample.txt
 downloads/
 test.pdf
 downloads.db
+
+# Maven build output
+target/
+
+# SQLite WAL side files
+downloads.db-wal
+downloads.db-shm

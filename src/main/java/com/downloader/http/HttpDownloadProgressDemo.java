@@ -74,7 +74,6 @@ public class HttpDownloadProgressDemo {
             }
         }
 
-        Files.exists(tempFile);
         System.out.println(Files.size(tempFile));
 
         try {

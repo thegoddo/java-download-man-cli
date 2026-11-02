@@ -18,13 +18,34 @@ import java.util.regex.Pattern;
 
 public class HttpDownloader {
 
-    private final HttpClient client = HttpClient.newHttpClient();
+    private static final Pattern UNSATISFIED_RANGE =
+            Pattern.compile("bytes \\*/(\\d+)");
+
+    private final HttpClient client = HttpClient.newBuilder()
+            .followRedirects(HttpClient.Redirect.NORMAL)
+            .build();
 
     public void download(DownloadTask task)
             throws IOException, InterruptedException {
 
+        Path tempFile = downloadToPart(task);
+        moveIntoPlace(tempFile, task.getDestination());
+    }
+
+    public Path downloadToPart(DownloadTask task)
+            throws IOException, InterruptedException {
+
         Path destination = task.getDestination();
         Path tempFile = Path.of(destination.toString() + ".part");
+
+        Path folder = destination.toAbsolutePath().getParent();
+        if (folder != null && !Files.isDirectory(folder)) {
+            throw new IOException(
+                    "Destination folder '" + folder + "' does not exist. "
+                            + "Please create it first \u2014 this download "
+                            + "manager intentionally does not create folders."
+            );
+        }
 
         long existingBytes = Files.exists(tempFile)
                 ? Files.size(tempFile)
@@ -50,8 +71,20 @@ public class HttpDownloader {
             int statusCode = response.statusCode();
 
             if (statusCode == 416) {
+                long totalBytes = parseUnsatisfiedRangeTotal(response);
+
+                if (totalBytes >= 0 && existingBytes == totalBytes) {
+                    task.setTotalBytes(totalBytes);
+                    task.setDownloadedBytes(totalBytes);
+                    return tempFile;
+                }
+
+                Files.deleteIfExists(tempFile);
                 throw new IOException(
-                        "Requested byte range is not satisfiable."
+                        "Server rejected the resume range (HTTP 416) and "
+                                + "the partial file did not match the "
+                                + "server's file size, so it was deleted. "
+                                + "Run the download again to start over."
                 );
             }
 
@@ -153,6 +186,10 @@ public class HttpDownloader {
 
                 while ((bytesRead = inputStream.read(buffer)) != -1) {
 
+                    if (task.isCancellationRequested()) {
+                        throw new IOException("Download cancelled.");
+                    }
+
                     // Don't write bytes beyond the advertised range.
                     if (expectedResponseBytes >= 0
                             && responseBytes + bytesRead
@@ -193,6 +230,12 @@ public class HttpDownloader {
             }
         }
 
+        return tempFile;
+    }
+
+    public static void moveIntoPlace(Path tempFile, Path destination)
+            throws IOException {
+
         // Move only after all validation succeeds.
         try {
             Files.move(
@@ -208,5 +251,16 @@ public class HttpDownloader {
                     StandardCopyOption.REPLACE_EXISTING
             );
         }
+    }
+
+    private static long parseUnsatisfiedRangeTotal(
+            HttpResponse<InputStream> response) {
+
+        return response.headers()
+                .firstValue("Content-Range")
+                .map(UNSATISFIED_RANGE::matcher)
+                .filter(Matcher::matches)
+                .map(m -> Long.parseLong(m.group(1)))
+                .orElse(-1L);
     }
 }

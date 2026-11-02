@@ -5,7 +5,6 @@ import com.downloader.core.DownloadState;
 import java.net.URI;
 import java.nio.file.Path;
 
-// One row of the downloads table.
 public record DownloadRecord(
         long id,
         URI uri,

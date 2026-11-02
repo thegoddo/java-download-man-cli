@@ -21,8 +21,6 @@ import java.util.concurrent.TimeUnit;
 
 public class DownloadManager {
 
-    // Save progress to the database at most once per second,
-    // or sooner if this many bytes arrived since the last save.
     private static final long PROGRESS_SAVE_INTERVAL_NANOS =
             TimeUnit.SECONDS.toNanos(1);
     private static final long PROGRESS_SAVE_BYTES = 4 * 1024 * 1024;
@@ -60,14 +58,17 @@ public class DownloadManager {
         return submit(downloadTask);
     }
 
-    // Re-submit every unfinished download stored in the database.
-    // HttpDownloader continues from the existing .part file.
-    public synchronized List<Future<String>> resumeDownloads() {
+    public List<Future<String>> resumeDownloads() {
+        return resumeDownloads(false);
+    }
+
+    public synchronized List<Future<String>> resumeDownloads(
+            boolean includeFailed) {
 
         List<DownloadRecord> records;
 
         try {
-            records = repository.findResumable();
+            records = repository.findResumable(includeFailed);
         } catch (SQLException e) {
             System.err.println(
                     "Could not load resumable downloads: " + e.getMessage()
@@ -78,6 +79,23 @@ public class DownloadManager {
         List<Future<String>> futures = new ArrayList<>();
 
         for (DownloadRecord record : records) {
+
+            if (isActive(record.id())) {
+                continue;
+            }
+
+            try {
+                if (!repository.claimForResume(record)) {
+                    continue;
+                }
+            } catch (SQLException e) {
+                System.err.println(
+                        "Could not claim download " + record.id()
+                                + ": " + e.getMessage()
+                );
+                continue;
+            }
+
             DownloadTask task = DownloadTask.restore(
                     record.id(),
                     record.uri(),
@@ -86,12 +104,23 @@ public class DownloadManager {
                     record.totalBytes()
             );
 
-            // The record may say DOWNLOADING or FAILED; it is queued again now.
-            saveTask(task);
             futures.add(submit(task));
         }
 
         return futures;
+    }
+
+    private boolean isActive(long id) {
+        for (DownloadTask task : downloadFutures.keySet()) {
+            if (task.getId() == id) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    int activeDownloadCount() {
+        return downloadFutures.size();
     }
 
     private Future<String> submit(DownloadTask downloadTask) {
@@ -103,7 +132,6 @@ public class DownloadManager {
             try {
                 return runDownload(downloadTask);
             } finally {
-                // Final write: end state and last progress value.
                 saveTask(downloadTask);
             }
         });
@@ -116,22 +144,27 @@ public class DownloadManager {
 
     private String runDownload(DownloadTask downloadTask) {
 
-        if (!downloadTask.startDownload()) {
-            return "Download Cancelled";
-        }
-
-        saveTask(downloadTask);
-
-        try {
-            httpDownloader.download(downloadTask);
-
-            if (downloadTask.markTransferFinished()) {
-                downloadTask.transitionTo(DownloadState.COMPLETED);
-                return "Download Complete";
+        synchronized (this) {
+            if (!downloadTask.startDownload()) {
+                return "Download Cancelled";
             }
 
-            downloadTask.transitionTo(DownloadState.CANCELLED);
-            return "Download Cancelled";
+            saveTask(downloadTask);
+        }
+
+        try {
+            Path partFile = httpDownloader.downloadToPart(downloadTask);
+
+            if (!downloadTask.markTransferFinished()) {
+                downloadTask.transitionTo(DownloadState.CANCELLED);
+                return "Download Cancelled";
+            }
+
+            HttpDownloader.moveIntoPlace(
+                    partFile, downloadTask.getDestination());
+
+            downloadTask.transitionTo(DownloadState.COMPLETED);
+            return "Download Complete";
 
         } catch (InterruptedException e) {
 
@@ -154,6 +187,16 @@ public class DownloadManager {
 
             downloadTask.transitionTo(DownloadState.FAILED);
             return "Download failed: " + e.getMessage();
+
+        } catch (RuntimeException e) {
+
+            if (downloadTask.isCancellationRequested()) {
+                downloadTask.transitionTo(DownloadState.CANCELLED);
+                return "Download Cancelled";
+            }
+
+            downloadTask.transitionTo(DownloadState.FAILED);
+            return "Download failed: " + e;
         }
     }
 
@@ -174,11 +217,7 @@ public class DownloadManager {
             return false;
         }
 
-        // A queued task goes straight to CANCELLED and never runs,
-        // so save that state here.
-        if (task.getState() == DownloadState.CANCELLED) {
-            saveTask(task);
-        }
+        saveCancelled(task);
 
         boolean cancelled = future.cancel(true);
 
@@ -191,10 +230,12 @@ public class DownloadManager {
 
         Future<String> completedFuture = completionService.take();
 
-        DownloadTask task = futureToTask.remove(completedFuture);
+        synchronized (this) {
+            DownloadTask task = futureToTask.remove(completedFuture);
 
-        if (task != null) {
-            downloadFutures.remove(task);
+            if (task != null) {
+                downloadFutures.remove(task);
+            }
         }
 
         return completedFuture;
@@ -224,7 +265,7 @@ public class DownloadManager {
                 Thread.currentThread().interrupt();
                 throw e;
 
-            } catch (IOException e) {
+            } catch (IOException | RuntimeException e) {
 
                 task.transitionTo(DownloadState.FAILED);
                 throw e;
@@ -244,8 +285,6 @@ public class DownloadManager {
         }
     }
 
-    // Prints every download stored in the database, including
-    // downloads from previous runs.
     public void printAllTasks() {
 
         System.out.println("Download History");
@@ -307,9 +346,6 @@ public class DownloadManager {
         }
     }
 
-    // Persistence helpers. Failures are logged, never thrown,
-    // so a database problem does not stop a download.
-
     private void saveNewTask(DownloadTask task) {
         try {
             task.setId(repository.insert(
@@ -329,12 +365,12 @@ public class DownloadManager {
         }
 
         try {
-            repository.updateProgress(
+            repository.update(
                     task.getId(),
+                    task.getState(),
                     task.getDownloadedBytes(),
                     task.getTotalBytes()
             );
-            repository.updateState(task.getId(), task.getState());
         } catch (SQLException e) {
             System.err.println(
                     "Could not update download " + task.getId()
@@ -343,11 +379,23 @@ public class DownloadManager {
         }
     }
 
-    // Saves progress while bytes arrive, but not on every chunk.
+    private void saveCancelled(DownloadTask task) {
+        if (task.getId() < 0) {
+            return;
+        }
+
+        try {
+            repository.updateState(task.getId(), DownloadState.CANCELLED);
+        } catch (SQLException e) {
+            System.err.println(
+                    "Could not update download " + task.getId()
+                            + ": " + e.getMessage()
+            );
+        }
+    }
+
     private void saveProgressThrottled(DownloadTask task) {
 
-        // Only the download thread calls the listener, so plain
-        // local state is enough here.
         long[] lastSaveTime = {0};
         long[] lastSavedBytes = {-1};
 

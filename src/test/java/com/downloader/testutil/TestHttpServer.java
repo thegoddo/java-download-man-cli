@@ -13,14 +13,11 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-// Small in-process HTTP server for tests. Each serveXxx method registers
-// a path and returns the full URI to request.
 public final class TestHttpServer implements AutoCloseable {
 
     private final HttpServer server;
     private final ExecutorService executor = Executors.newCachedThreadPool();
 
-    // Every Range header the server received (null when none was sent).
     private final List<String> rangeHeaders = new CopyOnWriteArrayList<>();
 
     public TestHttpServer() throws IOException {
@@ -30,7 +27,6 @@ public final class TestHttpServer implements AutoCloseable {
         server.start();
     }
 
-    // Deterministic, non-repeating-ish test content.
     public static byte[] content(int size) {
         byte[] data = new byte[size];
         for (int i = 0; i < size; i++) {
@@ -43,7 +39,6 @@ public final class TestHttpServer implements AutoCloseable {
         return rangeHeaders;
     }
 
-    // Serves the content and honours "Range: bytes=N-" with 206.
     public URI serve(String path, byte[] content) {
         server.createContext(path, exchange -> {
             String range = recordRange(exchange);
@@ -51,6 +46,15 @@ public final class TestHttpServer implements AutoCloseable {
             if (range != null && range.startsWith("bytes=")
                     && range.endsWith("-")) {
                 int start = Integer.parseInt(range.substring(6, range.length() - 1));
+
+                if (start >= content.length) {
+                    exchange.getResponseHeaders().add("Content-Range",
+                            "bytes */" + content.length);
+                    exchange.sendResponseHeaders(416, -1);
+                    exchange.close();
+                    return;
+                }
+
                 int length = content.length - start;
 
                 exchange.getResponseHeaders().add("Content-Range",
@@ -68,7 +72,6 @@ public final class TestHttpServer implements AutoCloseable {
         return uri(path);
     }
 
-    // Always answers 200 with the whole file, whatever Range says.
     public URI serveIgnoringRange(String path, byte[] content) {
         server.createContext(path, exchange -> {
             recordRange(exchange);
@@ -77,7 +80,6 @@ public final class TestHttpServer implements AutoCloseable {
         return uri(path);
     }
 
-    // Answers with the given status and an empty body.
     public URI serveStatus(String path, int status) {
         server.createContext(path, exchange -> {
             recordRange(exchange);
@@ -87,7 +89,16 @@ public final class TestHttpServer implements AutoCloseable {
         return uri(path);
     }
 
-    // Sends the content in small chunks with a pause between them.
+    public URI serveRedirect(String path, URI target) {
+        server.createContext(path, exchange -> {
+            recordRange(exchange);
+            exchange.getResponseHeaders().add("Location", target.toString());
+            exchange.sendResponseHeaders(302, -1);
+            exchange.close();
+        });
+        return uri(path);
+    }
+
     public URI serveSlowly(String path, byte[] content,
                            int chunkSize, long delayMillis) {
         server.createContext(path, exchange -> {
@@ -101,7 +112,6 @@ public final class TestHttpServer implements AutoCloseable {
                     Thread.sleep(delayMillis);
                 }
             } catch (InterruptedException | IOException e) {
-                // Client went away or the server is shutting down.
             }
         });
         return uri(path);

@@ -8,11 +8,17 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.net.URI;
 import java.nio.file.Path;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.ResultSet;
+import java.sql.Statement;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class DownloadRepositoryTest {
 
@@ -96,11 +102,75 @@ class DownloadRepositoryTest {
         insert("completed.bin", DownloadState.COMPLETED);
         insert("cancelled.bin", DownloadState.CANCELLED);
 
-        List<Long> ids = repository.findResumable().stream()
+        List<Long> withoutFailed = repository.findResumable(false).stream()
+                .map(DownloadRecord::id)
+                .toList();
+        List<Long> withFailed = repository.findResumable(true).stream()
                 .map(DownloadRecord::id)
                 .toList();
 
-        assertEquals(List.of(queued, downloading, failed), ids);
+        assertEquals(List.of(queued, downloading), withoutFailed);
+        assertEquals(List.of(queued, downloading, failed), withFailed);
+    }
+
+    @Test
+    void updateSavesStateAndProgressTogether() throws Exception {
+        long id = insert("a.bin", DownloadState.QUEUED);
+
+        repository.update(id, DownloadState.COMPLETED, 2000, 2000);
+
+        DownloadRecord record = repository.findAll().get(0);
+        assertEquals(DownloadState.COMPLETED, record.state());
+        assertEquals(2000, record.downloadedBytes());
+        assertEquals(2000, record.totalBytes());
+    }
+
+    @Test
+    void onlyOneOfTwoConnectionsCanClaimARow() throws Exception {
+        insert("a.bin", DownloadState.DOWNLOADING);
+
+        try (DownloadRepository other =
+                     new DownloadRepository(tempDir.resolve("test.db"))) {
+
+            DownloadRecord mine = repository.findResumable(false).get(0);
+            DownloadRecord theirs = other.findResumable(false).get(0);
+
+            assertTrue(repository.claimForResume(mine));
+            assertFalse(other.claimForResume(theirs));
+        }
+
+        assertEquals(DownloadState.QUEUED,
+                repository.findAll().get(0).state());
+    }
+
+    @Test
+    void rowsWithUnknownStateAreSkipped() throws Exception {
+        long good = insert("good.bin", DownloadState.QUEUED);
+        long bad = insert("bad.bin", DownloadState.QUEUED);
+
+        try (Connection connection = DriverManager.getConnection(
+                "jdbc:sqlite:" + tempDir.resolve("test.db").toAbsolutePath());
+             Statement statement = connection.createStatement()) {
+            statement.executeUpdate(
+                    "UPDATE downloads SET state = 'PAUSED' WHERE id = " + bad);
+        }
+
+        assertEquals(List.of(good), repository.findAll().stream()
+                .map(DownloadRecord::id).toList());
+        assertEquals(List.of(good), repository.findResumable(true).stream()
+                .map(DownloadRecord::id).toList());
+    }
+
+    @Test
+    void databaseUsesWalJournalMode() throws Exception {
+        try (Connection connection = DriverManager.getConnection(
+                "jdbc:sqlite:" + tempDir.resolve("test.db").toAbsolutePath());
+             Statement statement = connection.createStatement();
+             ResultSet rs = statement.executeQuery("PRAGMA journal_mode")) {
+
+            assertTrue(rs.next());
+            assertEquals("wal", rs.getString(1).toLowerCase());
+        }
     }
 
     @Test
